@@ -81,6 +81,22 @@ output_price = 15.0
 
 the context matters: bise compacts a conversation before it fills the window. a window set too large ends in an error from the server instead.
 
+## model discovery
+
+a gateway that tells what models it has can keep its own list fresh. give bise the URL a GET answers that list from, and bise fetches it in the background (the hub's thread, at most once a day, like the APIs' effort lists; a failure keeps yesterday's):
+
+```toml title="~/.bise/config.toml"
+[providers.zen]
+api = "openai-chat"
+base_url = "https://opencode.ai/inference/go/openai/v1"
+key_env = "OPENCODE_API_KEY"
+models_url = "https://opencode.ai/inference/go/v1/models"
+```
+
+then `bise models zen` lists what the gateway answers, its new models included, marked `(live)`: a model the built-in table and config.toml do not list. the answer's own fields set the model's limits: context, output, image input, reasoning and its efforts, tools, and prices where the answer carries them. models the tables already list stay as they are, typed, never a fetch's word.
+
+a plain gateway that answers just ids (LiteLLM, vLLM, Ollama's `/v1`) lists those ids, each at its provider's limits: set `context` under the provider, or per model in config.toml, when 128k of context is too small a guess.
+
 ## gateways behind a login
 
 some gateways want a short-lived token or extra headers, the way Claude Code uses `apiKeyHelper` and `ANTHROPIC_CUSTOM_HEADERS`:

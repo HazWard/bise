@@ -233,7 +233,13 @@ fn env_for_spawn() -> Vec<(String, Option<String>)> {
     let url_env = |k: &str| bise_catalog::with_files(&env, &files, k);
     let mut out = match Store::read(&paths.auth_file) {
         Ok(store) => {
-            let setup = bise_catalog::Setup::from_parts(std::fs::read_to_string(&paths.config).ok().as_deref(), &[], &|k| std::env::var(k).ok(), &url_env);
+            let setup = bise_catalog::Setup::from_parts(
+                std::fs::read_to_string(&paths.config).ok().as_deref(),
+                &[],
+                &[],
+                &|k| std::env::var(k).ok(),
+                &url_env,
+            );
             Keys { env: &env, store: &store, files: &files }
                 .resolve(&setup.catalog)
                 .spawn_env(&setup.catalog, &ours)

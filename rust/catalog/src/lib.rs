@@ -24,6 +24,7 @@ pub mod chatgpt;
 pub mod cli;
 pub mod config_cli;
 pub mod detect;
+pub mod discover;
 pub mod features;
 mod efforts;
 pub use efforts::*;
@@ -245,6 +246,10 @@ impl PartialCaps {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
     Builtin,
+    /// fetched from the provider's model list ([`discover`], the
+    /// `models_url` key): a model the built-in and the config tables do
+    /// not know, listed because its provider's model list names it
+    Live,
     Config,
 }
 
@@ -273,6 +278,10 @@ pub struct Provider {
     /// its speech-to-text wire family (BISE-130), one of
     /// [`voice::STT_FAMILIES`]; "" = it does not transcribe
     pub stt: String,
+    /// the URL a GET answers this provider's model list from (an
+    /// OpenAI-ish `"data": [{"id": ..., limits, capabilities, prices}]`);
+    /// "" = none: the built-in and config tables say what it has
+    pub models_url: String,
     /// `kind = "stt"`: it only transcribes (no chat models: not in the
     /// chat list, not in the runtime's hand-off)
     pub stt_only: bool,
@@ -667,6 +676,7 @@ impl Catalog {
                                 needs: String::new(),
                                 small_model: String::new(),
                                 stt: String::new(),
+                                models_url: String::new(),
                                 stt_only: false,
                                 decides: false,
                                 hint: String::new(),
@@ -703,6 +713,7 @@ impl Catalog {
                                             p.base_url = u;
                                             p.base_url_from = match src {
                                                 Source::Builtin => "built-in".into(),
+                                                Source::Live => "config".into(),
                                                 Source::Config => "config".into(),
                                             };
                                         }
@@ -714,6 +725,12 @@ impl Catalog {
                                     "small_model" => set_str(&mut p.small_model, s(), &where_, fk, &mut warn),
                                     "hint" => set_str(&mut p.hint, s(), &where_, fk, &mut warn),
                                     "keys_url" => set_str(&mut p.keys_url, s(), &where_, fk, &mut warn),
+                                    "models_url" => match s() {
+                                        Some(u) if u.is_empty() || u.starts_with("http://") || u.starts_with("https://") => {
+                                            p.models_url = u
+                                        }
+                                        _ => warn(format!("{}.models_url: an http(s) URL", where_)),
+                                    },
                                     "signup_url" => set_str(&mut p.signup_url, s(), &where_, fk, &mut warn),
                                     "billing_url" => set_str(&mut p.billing_url, s(), &where_, fk, &mut warn),
                                     "model" => set_str(&mut p.model, s(), &where_, fk, &mut warn),
@@ -1108,16 +1125,18 @@ impl Setup {
     /// is a warning: its tables are ignored, `model`/`agent_model` lines
     /// are still read.
     pub fn from_text(config: Option<&str>, env: &dyn Fn(&str) -> Option<String>) -> Setup {
-        Setup::from_parts(config, &[], env, env)
+        Setup::from_parts(config, &[], &[], env, env)
     }
 
     /// [`Setup::from_text`] with the APIs' effort lists (`live`,
-    /// [`live_fetch::read`]: over the table, under config.toml) and the
-    /// base URLs' variables read through `url_env` (the env, then the
-    /// .env files: [`Setup::load`]).
+    /// [`live_fetch::read`]: over the table, under config.toml), the
+    /// providers' model lists their `models_url` gives (`discovered`,
+    /// [`discover::read`]), and the base URLs' variables read through
+    /// `url_env` (the env, then the .env files: [`Setup::load`]).
     pub fn from_parts(
         config: Option<&str>,
         live: &[(String, Vec<String>)],
+        discovered: &[(String, serde_json::Value)],
         env: &dyn Fn(&str) -> Option<String>,
         url_env: &dyn Fn(&str) -> Option<String>,
     ) -> Setup {
@@ -1169,6 +1188,7 @@ impl Setup {
                 }
             }
         }
+        catalog = catalog.with_discovered(discovered);
         catalog.base_urls_from_env(url_env);
         let envv = |k: &str| env(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
         let (model, model_from) = if let Some(m) = envv("BISE_MODEL") {
@@ -1288,7 +1308,13 @@ impl Setup {
         let files = auth::EnvFile::read_all(&home.env_files());
         let real = |k: &str| std::env::var(k).ok();
         let store = auth::Store::read(&home.auth_file()).unwrap_or_default();
-        Setup::from_parts(text.as_deref(), &live_fetch::read(&home.cache_dir()), &real, &|k| with_files(&real, &files, k))
+        Setup::from_parts(
+            text.as_deref(),
+            &live_fetch::read(&home.cache_dir()),
+            &discover::read(&home.cache_dir()),
+            &real,
+            &|k| with_files(&real, &files, k),
+        )
             .with_live_stt(&voice_live::read(&home.cache_dir()))
             .with_keys(&auth::Keys { env: &real, store: &store, files: &files })
             .with_plan_lists(plan_list::read(&home.cache_dir()))

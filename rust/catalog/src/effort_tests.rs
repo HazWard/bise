@@ -132,7 +132,7 @@ fn the_list_comes_from_config_then_the_api_then_the_table_then_the_family() {
         ("anthropic/not-listed".to_string(), vec!["low".to_string()]),
     ];
     let cfg = "[models.\"anthropic/claude-sonnet-5-5\"]\nefforts = \"medium\"\n";
-    let s = Setup::from_parts(Some(cfg), &live, &no_env, &no_env);
+    let s = Setup::from_parts(Some(cfg), &live, &[], &no_env, &no_env);
     assert_eq!(words(&s, "anthropic/claude-sonnet-5-5"), "medium", "config.toml first");
     assert_eq!(words(&s, "anthropic/claude-opus-5-5"), "none,low,max", "then the API's");
     assert_eq!(words(&s, "anthropic/claude-fable-5-1"), "none,low,medium,high,xhigh,max", "then the table's");
@@ -251,7 +251,7 @@ fn no_network_no_file_the_table_and_the_family() {
     let lines = live_fetch::refresh(&paths(&dir), &dir.join("cache"), &setup, &keys, 1_000);
     assert!(t.elapsed() < std::time::Duration::from_secs(3) && lines.len() == 1, "{lines:?} {:?}", t.elapsed());
     assert!(live_fetch::read(&dir.join("cache")).is_empty());
-    let s = Setup::from_parts(Some(cfg), &live_fetch::read(&dir.join("cache")), &no_env, &no_env);
+    let s = Setup::from_parts(Some(cfg), &live_fetch::read(&dir.join("cache")), &[], &no_env, &no_env);
     assert_eq!(s.catalog.resolve("anthropic/claude-opus-5-5").efforts(), ["none", "low", "medium", "high", "xhigh", "max"]);
     let _ = std::fs::remove_dir_all(&dir);
 }

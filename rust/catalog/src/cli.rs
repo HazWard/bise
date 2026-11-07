@@ -170,7 +170,11 @@ pub fn render_styled(s: &Setup, filter: Option<&str>, keys: &Keys, home: Option<
         ));
         for m in shown {
             let r = c.resolve(&m.name());
-            let mark = if m.source == Source::Config { "  (config)" } else { "" };
+            let mark = match m.source {
+                Source::Config => "  (config)",
+                Source::Live => "  (live)",
+                Source::Builtin => "",
+            };
             o.push_str(&format!("  {:<52} {}{}\n", m.name(), st.dim(&caps_text(&r)), st.faint(mark)));
         }
         let base = Resolved {
@@ -197,10 +201,12 @@ fn usage() -> String {
         "{cli} models [filter]: the models bise knows
 
 lists the providers and models (built in, plus config.toml's
-[providers.<id>] and [models.\"<provider>/<model>\"]), where each
-provider's key comes from, the models in use (model, agent_model,
-small_model) and the voice input's providers ('voice' as the filter
-lists only them). any \"<provider>/<model>\" works, listed or not.",
+[providers.<id>] and [models.\"<provider>/<model>\"]: a provider whose
+config names a models_url lists that provider's whole model list, live
+fetched once a day, its new models included), where each provider's key
+comes from, the models in use (model, agent_model, small_model) and the
+voice input's providers ('voice' as the filter lists only them). any
+\"<provider>/<model>\" works, listed or not.",
         cli = CLI
     )
 }

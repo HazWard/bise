@@ -1182,7 +1182,7 @@ fn the_env_then_the_env_files_in_order() {
     assert_eq!(with_files(&env, &files, "X").as_deref(), Some("from-env"));
     assert_eq!(with_files(&env, &files, "Y"), None);
     // Ben's setup: key and URL in ~/.vibe/.env, nothing in config.toml
-    let s = Setup::from_parts(Some(OPUS), &[], &none, &|k| with_files(&none, &files, k));
+    let s = Setup::from_parts(Some(OPUS), &[], &[], &none, &|k| with_files(&none, &files, k));
     assert_eq!(s.model_for("main").base_url, "https://vibe.example/anthropic/v1");
 }
 
@@ -1294,5 +1294,104 @@ fn racing_role_writers_lose_no_change() {
     assert!(text.contains("language = \"fr\""), "{text}");
     let left: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).filter(|n| n.contains(".tmp-")).collect();
     assert!(left.is_empty(), "{left:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+
+// ---- the providers' model lists (discover, the `models_url` key) ----
+
+/// A fake models endpoint: answers `n` requests with `body`, then
+/// stops: a second fetch fails.
+fn serve_models(body: String, n: usize) -> u16 {
+    use std::io::{Read, Write};
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = l.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut s in l.incoming().take(n).flatten() {
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = s.write_all(head.as_bytes()).and_then(|_| s.write_all(body.as_bytes()));
+        }
+    });
+    port
+}
+
+fn discover_paths(dir: &std::path::Path) -> auth_cli::Paths {
+    auth_cli::Paths { auth_file: dir.join("auth.json"), config: dir.join("config.toml"), env_files: Vec::new(), home: None }
+}
+
+#[test]
+fn a_provider_models_url_caps_its_models() {
+    use serde_json::json;
+    let body = json!({
+        "data": [
+            {"id": "beam",
+             "modalities": {"input": ["text"], "output": ["text"]},
+             "capabilities": {"tools": {"supported": true}, "reasoning": {"supported": true, "effort": ["none", "low"]}},
+             "limit": {"context": 1048576, "output": 131072},
+             "cost": {"text": {"input": {"price": 0.15, "cache": {"read": 0.01}}, "output": {"price": 0.6}}}},
+            {"id": "tiny"},
+            {"id": "speech", "type": "stt"},
+        ]
+    });
+    let zen_port = serve_models(body.to_string(), 1);
+    // a provider with a key_env and none found: its server is never asked
+    let fox_net = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let fox_port = fox_net.local_addr().unwrap().port();
+    fox_net.set_nonblocking(true).unwrap();
+
+    let dir = std::env::temp_dir().join(format!("bise-catalog-discover-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let config = dir.join("config.toml");
+    std::fs::create_dir_all(&dir).unwrap();
+    // the home's cache: what Setup::load reads the store from
+    let home = bise_home::Home::from_env();
+    let cache = home.cache_dir();
+    let _ = std::fs::remove_file(cache.join("provider-models.json"));
+    let cfg = format!(
+        "[providers.zen]\nbase_url = \"http://127.0.0.1:{zen_port}/v1\"\nmodels_url = \"http://127.0.0.1:{zen_port}/v1/models\"\n\
+         [providers.fox]\nbase_url = \"http://127.0.0.1:{fox_port}/v1\"\nmodels_url = \"http://127.0.0.1:{fox_port}/v1/models\"\nkey_env = \"FOX_KEY\"\n"
+    );
+    std::fs::write(&config, &cfg).unwrap();
+
+    let run = Setup::load(&config);
+    assert!(run.catalog.model("zen/beam").is_none(), "no list fetched yet");
+    let keys = auth::Keys { env: &no_env, store: &auth::Store::default(), files: &[] };
+    let lines = live_fetch::refresh(&discover_paths(&dir), &cache, &run, &keys, 1_000);
+    assert_eq!(lines, ["models: 2 listed by zen"], "beam and tiny, the transcription one out; fox has no key: skipped");
+    assert!(fox_net.accept().is_err(), "no key for fox: no fetch");
+    // the store is written; the next read lists them
+    let s = Setup::load(&config);
+    let m = s.catalog.model("zen/beam").unwrap();
+    assert_eq!(m.source, Source::Live);
+    let r = s.catalog.resolve("zen/beam");
+    assert_eq!(r.known, Known::Listed);
+    assert_eq!((r.caps.context, r.caps.max_output, r.caps.vision, r.caps.reasoning), (1_048_576, 131_072, false, true));
+    assert_eq!((r.price.input, r.price.output, r.price.cache_read), (Some(150_000), Some(600_000), Some(10_000)));
+    assert_eq!(r.efforts(), ["none", "low"]);
+    // a model of the list alone: its provider's defaults
+    let r = s.catalog.resolve("zen/tiny");
+    assert_eq!((r.known, r.caps.context), (Known::Listed, 128_000));
+    assert_eq!(s.catalog.model("zen/speech"), None, "not a chat model, not listed");
+    // the listing marks it live
+    let out = cli::render(&s, Some("zen"), &keys, None);
+    assert!(out.contains("zen/beam") && out.contains("(live)"), "{out}");
+    // the hand-off carries it, and reads back
+    let h = s.handoff_toml();
+    assert!(h.contains("[models.\"zen/beam\"]\ncontext = 1048576\nmax_output = 131072"), "{h}");
+    let back = setup(&h);
+    assert_eq!(back.catalog.resolve("zen/beam").caps.context, 1_048_576);
+    // the refresh reads the store as changed
+    assert!(live_fetch::stamp(&config, &cache).is_some());
+    // a day later the server is down (it answered once): the old list stays
+    let lines = live_fetch::refresh(&discover_paths(&dir), &cache, &run, &keys, 1_000 + discover::TTL_MS);
+    assert!(lines.len() == 1 && lines[0].starts_with("models: zen kept its old list"), "{lines:?}");
+    let s = Setup::load(&config);
+    assert!(s.catalog.model("zen/beam").is_some(), "the fetched list survives a failed fetch");
+    let _ = std::fs::remove_file(cache.join("provider-models.json"));
     let _ = std::fs::remove_dir_all(&dir);
 }

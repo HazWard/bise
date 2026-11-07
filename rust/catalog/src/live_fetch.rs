@@ -17,6 +17,7 @@ use bend_plugins::http::{self, Url};
 use serde_json::Value;
 
 use crate::auth::Keys;
+use crate::discover;
 use crate::live_efforts::{self, Store, FETCHED};
 use crate::{auth_cli::Paths, chatgpt, voice_live, Provider, Setup};
 
@@ -51,7 +52,7 @@ pub fn read(cache_dir: &Path) -> Vec<(String, Vec<String>)> {
 
 /// One provider's lists from its API, or why not.
 fn fetch(p: &Provider, key: &str) -> Result<Vec<(String, Vec<String>)>, String> {
-    let v = get_models(p, key)?;
+    let v = get_json(&format!("{}/models", p.base_url.trim_end_matches('/')), p, key)?;
     let lists = if p.api == "anthropic" { live_efforts::parse_anthropic(&v) } else { live_efforts::parse_openrouter(&v) };
     if lists.is_empty() {
         return Err(format!("{}'s model list has no effort list", p.name));
@@ -59,9 +60,10 @@ fn fetch(p: &Provider, key: &str) -> Result<Vec<(String, Vec<String>)>, String> 
     Ok(lists)
 }
 
-/// A provider's `/models` answer, or why not.
-fn get_models(p: &Provider, key: &str) -> Result<Value, String> {
-    let url = Url::parse(&format!("{}/models", p.base_url.trim_end_matches('/')))?;
+/// A GET's answer, or why not. The URL is the caller's: the APIs' own
+/// `{base_url}/models`, or a provider's `models_url`.
+fn get_json(url: &str, p: &Provider, key: &str) -> Result<Value, String> {
+    let url = Url::parse(url)?;
     let h: Vec<(String, String)> = match p.api.as_str() {
         "anthropic" => vec![("x-api-key".into(), key.into()), ("anthropic-version".into(), "2023-06-01".into())],
         _ => vec![("Authorization".into(), format!("Bearer {key}"))],
@@ -87,7 +89,7 @@ fn refresh_voice(cache_dir: &Path, setup: &Setup, keys: &Keys, now_ms: u64) -> V
         if p.base_url.is_empty() || !store.due(id, now_ms) {
             continue;
         }
-        match get_models(p, &key).map(|v| voice_live::parse(&v)) {
+        match get_json(&format!("{}/models", p.base_url.trim_end_matches('/')), p, &key).map(|v| voice_live::parse(&v)) {
             Ok(ids) if !ids.is_empty() => {
                 out.push(format!("voice: {} transcription models from {}", ids.len(), id));
                 store = store.with(id, now_ms, ids);
@@ -131,6 +133,7 @@ pub fn refresh(paths: &Paths, cache_dir: &Path, setup: &Setup, keys: &Keys, now_
             out.push(format!("efforts: cannot write {}: {e}", store_path(cache_dir).display()));
         }
     }
+    out.extend(refresh_discovered(cache_dir, setup, keys, now_ms));
     // ChatGPT: its own model list carries the levels (chatgpt.rs writes it)
     if setup.catalog.provider("chatgpt").is_some_and(|p| keys.signed_in(p)) && !chatgpt::models_fresh(paths) {
         match chatgpt::fetch_models(paths) {
@@ -139,6 +142,54 @@ pub fn refresh(paths: &Paths, cache_dir: &Path, setup: &Setup, keys: &Keys, now_
         }
     }
     out.extend(refresh_voice(cache_dir, setup, keys, now_ms));
+    out
+}
+
+/// The key a GET may send: none (an auth-less gateway), or the
+/// provider's (a key not found: None, not the empty string).
+fn key_of(p: &Provider, keys: &Keys) -> Option<String> {
+    if p.key_env.is_empty() {
+        Some(String::new())
+    } else {
+        keys.for_provider(p).map(|f| f.key)
+    }
+}
+
+/// The providers whose config names a model list (`models_url`): the
+/// ones that are due ([`discover::TTL_MS`], a day), a chat provider with
+/// a key that can go out (an auth-less gateway: no key needed, bise
+/// sends the family's headers either way). One line each, for the hub's
+/// log; a failure keeps the old store.
+fn refresh_discovered(cache_dir: &Path, setup: &Setup, keys: &Keys, now_ms: u64) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut raws = discover::Store::read(cache_dir);
+    let mut changed = false;
+    for p in setup
+        .catalog
+        .providers
+        .iter()
+        .filter(|p| !p.models_url.is_empty() && p.chats() && p.needs.is_empty())
+    {
+        if !raws.due(&p.id, now_ms) {
+            continue;
+        }
+        let Some(key) = key_of(p, keys) else { continue };
+        match get_json(&p.models_url, p, &key) {
+            Ok(v) => {
+                let n = discover::parse(&v).len();
+                out.push(format!("models: {n} listed by {}", p.id));
+                raws = raws.with(&p.id, now_ms, v);
+                changed = true;
+            }
+            Err(e) => out.push(format!("models: {} kept its old list: {e}", p.id)),
+        }
+    }
+    if changed {
+        let path = discover::store_path(cache_dir);
+        if let Err(e) = write_file(&path, &raws.to_json()) {
+            out.push(format!("models: cannot write {}: {e}", path.display()));
+        }
+    }
     out
 }
 
@@ -163,11 +214,16 @@ pub fn spawn_refresher(paths: Paths, cache_dir: std::path::PathBuf, log: fn(&str
 }
 
 /// What a [`Setup::load`] reads changed since: the latest change of
-/// `config` and of the API lists (efforts.json, chatgpt-models.json,
-/// voice-models.json).
+/// `config` and of the API lists (efforts.json, provider-models.json,
+/// chatgpt-models.json, voice-models.json).
 pub fn stamp(config: &Path, cache_dir: &Path) -> Option<std::time::SystemTime> {
     let at = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-    let lists = [store_path(cache_dir), cache_dir.join("chatgpt-models.json"), voice_live::store_path(cache_dir)];
+    let lists = [
+        store_path(cache_dir),
+        discover::store_path(cache_dir),
+        cache_dir.join("chatgpt-models.json"),
+        voice_live::store_path(cache_dir),
+    ];
     std::iter::once(at(config)).chain(lists.iter().map(|p| at(p))).flatten().max()
 }
 
@@ -197,7 +253,8 @@ fn write_file(path: &Path, text: &str) -> std::io::Result<()> {
 /// the .env files read again, so an edit reaches the next call).
 pub fn export_handoff(config: &Path, cache_dir: &Path, env: &dyn Fn(&str) -> Option<String>) -> Option<std::path::PathBuf> {
     let text = std::fs::read_to_string(config).ok();
-    let setup = Setup::from_parts(text.as_deref(), &read(cache_dir), env, env).with_plan_lists(crate::plan_list::read(cache_dir));
+    let setup = Setup::from_parts(text.as_deref(), &read(cache_dir), &discover::read(cache_dir), env, env)
+        .with_plan_lists(crate::plan_list::read(cache_dir));
     let fallback = std::env::temp_dir().join(format!("bise-models-{}.toml", std::process::id()));
     let mut why = Vec::new();
     let found = [cache_dir.join("models.toml"), fallback]
